@@ -37,13 +37,17 @@
   }
   button:hover { filter: brightness(1.1); }
   button.secondary { background: var(--panel2); color: var(--text); border: 1px solid var(--line); }
+  button.small { width: auto; margin-top: 0; padding: 5px 12px; font-size: 12px; }
   .link-item {
     padding: 9px 10px; border: 1px solid var(--line); border-radius: 6px;
     margin-bottom: 8px; cursor: pointer; background: var(--panel2);
   }
   .link-item.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
-  .link-item .nm { font-weight: 600; }
+  .link-item .nm { font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
   .link-item .id { color: var(--muted); font-size: 11px; font-family: ui-monospace, monospace; }
+  .role { font-size: 10px; padding: 1px 7px; border-radius: 999px; font-weight: 600; }
+  .role.primary { background: rgba(79,163,255,.2); color: var(--accent); }
+  .role.secondary { background: rgba(192,132,252,.2); color: var(--rej); }
   .stat-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
   .stat {
     flex: 1; min-width: 130px; background: var(--panel2); border: 1px solid var(--line);
@@ -70,25 +74,33 @@
   .hint { color: var(--muted); font-size: 11.5px; margin-top: 6px; }
   .empty { color: var(--muted); padding: 20px; text-align: center; }
   #verdict { margin-top: 10px; font-size: 12.5px; min-height: 18px; }
+  .station-card {
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+    margin-bottom: 10px; background: var(--panel2);
+  }
+  .station-card .top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .station-card.closed { opacity: .65; }
+  .added-pos { color: var(--ok); font-family: ui-monospace, monospace; }
+  .two-col { display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:18px; }
 </style>
 </head>
 <body>
 <header>
   <h1>🛰️ 深空地面站 · 32 位帧计数滑动窗口接收器</h1>
-  <p>64 位扩展序号 + 64 位位图 · 最近纪元候选裁决 · 回执标识去重 · SQLite 单事务持久化</p>
+  <p>64 位扩展序号 + 64 位位图 · 主/副接收站同源快照 · 断联分集接收 · 单次收敛并集 · SQLite 单事务持久化</p>
 </header>
 
 <div class="layout">
   <div>
     <div class="panel">
-      <h2>创建链路</h2>
+      <h2>创建主链路</h2>
       <label for="lnk-name">链路名称</label>
       <input id="lnk-name" placeholder="例如 Voyager-1 下行">
-      <button onclick="createLink()">创建链路</button>
+      <button onclick="createLink()">创建主链路</button>
     </div>
 
     <div class="panel" style="margin-top:16px">
-      <h2>链路列表</h2>
+      <h2>站列表</h2>
       <div id="link-list"><div class="empty">尚无链路</div></div>
       <button class="secondary" onclick="loadLinks()">刷新</button>
     </div>
@@ -126,7 +138,8 @@ async function loadLinks() {
   if (!r.ok || !r.data.links.length) { box.innerHTML = '<div class="empty">尚无链路</div>'; return; }
   box.innerHTML = r.data.links.map(l =>
     `<div class="link-item ${currentLink === l.id ? 'active' : ''}" onclick="selectLink('${l.id}')">
-       <div class="nm">${escapeHtml(l.name)}</div>
+       <div class="nm">${escapeHtml(l.name)}
+         <span class="role ${l.role}">${l.role === "primary" ? "主站" : "副站"}</span></div>
        <div class="id">${l.id}</div>
      </div>`).join("");
 }
@@ -145,28 +158,38 @@ async function selectLink(id) {
 }
 
 function renderMain(l) {
+  const roleLine = l.role === "primary"
+    ? '<span class="role primary">主接收站</span>'
+    : '<span class="role secondary">副接收站</span>';
+  const basis = l.role === "secondary" ? `
+    <div class="stat">
+      <div class="k">同源快照基准最高序号</div>
+      <div class="v">${l.snapshot.highest === null ? "—" : l.snapshot.highest}</div>
+    </div>` : "";
   document.getElementById("main-panel").innerHTML = `
-    <h2 style="margin-top:0">链路 <span id="m-name"></span></h2>
+    <h2 style="margin-top:0">${roleLine} <span id="m-name"></span>
+      ${l.role === "secondary" && l.converged ? '<span class="badge rejected">已收敛 · 关闭</span>' : ""}</h2>
     <div class="stat-row">
-      <div class="stat"><div class="k">当前最高扩展序号</div><div class="v" id="m-highest"></div></div>
+      <div class="stat"><div class="k">本站最高扩展序号</div><div class="v" id="m-highest"></div></div>
+      ${basis}
       <div class="stat"><div class="k">窗口大小</div><div class="v">64</div></div>
-      <div class="stat"><div class="k">链路 ID</div><div class="v" id="m-id" style="font-size:12px"></div></div>
+      <div class="stat"><div class="k">站 ID</div><div class="v" id="m-id" style="font-size:12px"></div></div>
     </div>
     <div class="hint">位图（位 0 = 最高序号，向右为更旧的位置；蓝底=最近已接受）</div>
     <div class="bits" id="m-bits"></div>
 
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:18px">
+    <div class="two-col">
       <div>
-        <h2>提交到达帧</h2>
+        <h2>在本站提交到达帧</h2>
         <label>无符号 32 位计数 counter</label>
         <input id="f-counter" placeholder="0 .. 4294967295" inputmode="numeric">
         <label>稳定回执标识 receipt_id</label>
         <input id="f-receipt" placeholder="例如 tx-0001">
         <label>载荷 payload（任意 JSON）</label>
         <textarea id="f-payload">{"sensor":"temp","value":2.7}</textarea>
-        <button onclick="submitFrame()">提交帧</button>
+        <button onclick="submitFrame()" ${l.role === "secondary" && l.converged ? "disabled" : ""}>提交帧</button>
         <div id="verdict"></div>
-        <div class="hint">相同 receipt_id + 相同 counter + 相同载荷重放 → 返回首次裁决；
+        <div class="hint">相同 receipt_id + 相同 counter + 相同载荷在同链路另一站重传，仍回放首次裁决；
         receipt_id 复用但改变链路/计数/载荷 → 409 拒绝。</div>
       </div>
       <div>
@@ -174,10 +197,56 @@ function renderMain(l) {
         <table><thead><tr><th>extended sequence</th></tr></thead>
         <tbody id="m-recent"></tbody></table>
       </div>
-    </div>`;
+    </div>
+
+    <div id="station-ops" style="margin-top:20px"></div>
+    <div id="converge-result"></div>`;
   document.getElementById("m-name").textContent = l.name;
   document.getElementById("m-id").textContent = l.id.slice(0, 12) + "…";
   refreshState(l);
+  if (l.role === "primary") renderPrimaryOps(l);
+  else renderSecondaryOps(l);
+}
+
+function renderPrimaryOps(l) {
+  const cards = (l.stations || []).map(s => `
+    <div class="station-card ${s.converged ? "closed" : ""}">
+      <div class="top">
+        <div>
+          <b>${escapeHtml(s.name)}</b>
+          <span class="role secondary">副站</span>
+          ${s.converged ? '<span class="badge rejected">已收敛</span>' : ""}
+        </div>
+        <button class="small" onclick="converge('${s.id}')" ${s.converged ? "disabled" : ""}>收敛</button>
+      </div>
+      <div class="hint">副站最高扩展序号：<b>${s.highest === null ? "—" : s.highest}</b>
+        · 快照基准：<b>${s.snapshot.highest === null ? "—" : s.snapshot.highest}</b>
+        · 已接受位置 ${s.recent.length} 个</div>
+      <div class="hint" id="snap-${s.id}">副站最近位置：${
+          s.recent.length ? s.recent.slice(0, 8).map(n => `<span class="added-pos">${n}</span>`).join(" ")
+          : "（快照后无新帧）"}${s.recent.length > 8 ? " …" : ""}</div>
+    </div>`).join("");
+  document.getElementById("station-ops").innerHTML = `
+    <h2>副接收站（同源快照）</h2>
+    <div class="hint">副站只能从主站当前接收状态建立：建立瞬间以共同基准（主站最高扩展序号与位图）校准，
+    断联期间两站分别收帧；收敛时把两站位图投影到较高序号后取并集，窗口外位置直接丢弃。</div>
+    <div style="margin:10px 0">
+      <label for="new-station-name">新副站名称</label>
+      <div style="display:flex;gap:8px">
+        <input id="new-station-name" placeholder="例如 备份接收阵 B">
+        <button class="small" style="margin-top:0;padding:8px 14px" onclick="createStation()">从当前快照建立副站</button>
+      </div>
+    </div>
+    <div id="station-cards">${cards || '<div class="empty">尚无副站</div>'}</div>`;
+}
+
+function renderSecondaryOps(l) {
+  document.getElementById("station-ops").innerHTML = `
+    <h2>副站快照信息</h2>
+    <div class="hint">同源主站：<span class="added-pos">${l.primary_id.slice(0, 12)}…</span>
+      · 建立时共同基准最高序号：<b>${l.snapshot.highest === null ? "—" : l.snapshot.highest}</b>
+      ${l.converged ? "· 本快照已收敛，收敛后双方窗口一致且本站停止接收。"
+                    : "· 收敛须在主站页面发起，仅可执行一次。"}</div>`;
 }
 
 function refreshState(l) {
@@ -197,16 +266,49 @@ function refreshState(l) {
     : '<tr><td class="empty">暂无</td></tr>';
 }
 
+async function createStation() {
+  const name = document.getElementById("new-station-name").value.trim() || "secondary";
+  const r = await api("POST", `/api/links/${currentLink}/stations`, { name });
+  if (!r.ok) { alert("建立副站失败: " + (r.data.error || r.status)); return; }
+  await loadLinks();
+  await selectLink(currentLink);
+}
+
+async function converge(stationId) {
+  const r = await api("POST",
+    `/api/links/${currentLink}/stations/${stationId}/converge`);
+  const box = document.getElementById("converge-result");
+  if (!r.ok) {
+    box.innerHTML = `<div class="hint" style="color:var(--exp)">收敛被拒绝：${escapeHtml(r.data.error || r.status)}</div>`;
+    return;
+  }
+  const d = r.data;
+  box.innerHTML = `
+    <div class="station-card">
+      <h2 style="margin-top:0">收敛结果</h2>
+      <div class="hint">合并后最高扩展序号：<b class="added-pos">${d.highest}</b>
+        · 主站收敛前最高 ${d.primary.highest} · 副站收敛前最高 ${d.secondary.highest}</div>
+      <div class="hint">被副站补入、主站原先缺失的位置（${d.added.length} 个）：</div>
+      <div>${d.added.length
+        ? d.added.map(n => `<span class="added-pos">${n}</span>`).join(" ")
+        : "（无；主站已包含副站全部位置）"}</div>
+      <div class="hint">两站窗口已在同一事务内写为一致状态；窗口外位置已丢弃，不会重新进入可接受范围。</div>
+    </div>`;
+  await loadLinks();
+  const fresh = await api("GET", "/api/links/" + currentLink);
+  if (fresh.ok) renderMain(fresh.data);
+}
+
 async function submitFrame() {
   const counterRaw = document.getElementById("f-counter").value.trim();
   const receipt = document.getElementById("f-receipt").value.trim();
   let payload;
   try { payload = JSON.parse(document.getElementById("f-payload").value || "null"); }
-  catch { setVerdict("载荷不是合法 JSON", "rejected"); return; }
-  if (!counterRaw || !receipt) { setVerdict("counter 与 receipt_id 必填", "rejected"); return; }
-  if (!/^\d+$/.test(counterRaw)) { setVerdict("counter 必须是无符号整数", "rejected"); return; }
+  catch { setVerdict("载荷不是合法 JSON"); return; }
+  if (!counterRaw || !receipt) { setVerdict("counter 与 receipt_id 必填"); return; }
+  if (!/^\d+$/.test(counterRaw)) { setVerdict("counter 必须是无符号整数"); return; }
   const counter = Number(counterRaw);
-  if (counter > 4294967295) { setVerdict("counter 超出 32 位范围", "rejected"); return; }
+  if (counter > 4294967295) { setVerdict("counter 超出 32 位范围"); return; }
 
   const r = await api("POST", `/api/links/${currentLink}/frames`,
     { counter, receipt_id: receipt, payload });
@@ -222,7 +324,7 @@ async function submitFrame() {
     扩展序号 <b>${d.extended}</b> · 最高 <b>${d.highest}</b>
     ${d.retransmit ? "· 重传回放首次裁决" : ""}`;
   const fresh = await api("GET", "/api/links/" + currentLink);
-  if (fresh.ok) refreshState(fresh.data);
+  if (fresh.ok) { renderMain(fresh.data); }
 }
 
 function setVerdict(msg) {

@@ -3,10 +3,13 @@
 Endpoints
     GET  /                       static single-page UI
     GET  /healthz                liveness probe -> 200 {"status":"ok"}
-    GET  /api/links              list links with window state
-    POST /api/links              {"name": ...} -> create link
-    GET  /api/links/{id}         link state (highest extended seq + bitmap)
-    POST /api/links/{id}/frames   submit an arriving frame
+    GET  /api/links              list links/stations with window state
+    POST /api/links              {"name": ...} -> create primary link
+    GET  /api/links/{id}         station state (highest extended seq + bitmap)
+    POST /api/links/{id}/frames   submit an arriving frame at station {id}
+    POST /api/links/{id}/stations {"name": ...} -> secondary from {id}'s snapshot
+    POST /api/links/{id}/stations/{sid}/converge
+                                 one-shot convergence of secondary {sid}
 
 Frame body: {"counter": <u32>, "receipt_id": "...", "payload": ...}
 Verdict:    {"status": "accepted|duplicate|expired|rejected", ...}
@@ -17,7 +20,7 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from .db import Database, ReceiptConflict
+from .db import Database, ReceiptConflict, StationError
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 COUNTER_MAX = (1 << 32) - 1
@@ -78,12 +81,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        parts = path.split("/")
         try:
             if path == "/api/links":
                 data = self._read_json()
                 name = str(data.get("name") or "link")
                 link = self._db().create_link(name[:128])
                 self._send_json(201, link)
+            elif (len(parts) == 5 and parts[1] == "api" and parts[2] == "links"
+                  and parts[3] and parts[4] == "stations"):
+                # /api/links/{id}/stations
+                self._create_station(parts[3])
+            elif (len(parts) == 7 and parts[1] == "api" and parts[2] == "links"
+                  and parts[4] == "stations" and parts[6] == "converge"
+                  and parts[3] and parts[5]):
+                # /api/links/{id}/stations/{sid}/converge
+                self._converge(parts[3], parts[5])
             elif path.startswith("/api/links/") and path.endswith("/frames"):
                 self._submit_frame(path.split("/")[3])
             else:
@@ -93,8 +106,20 @@ class Handler(BaseHTTPRequestHandler):
         except ReceiptConflict:
             self._send_json(409, {"error": "receipt id reused with a different "
                                            "link, counter or payload"})
+        except StationError as exc:
+            self._send_json(409, {"error": str(exc)})
         except LookupError:
             self._send_json(404, {"error": "unknown link"})
+
+    def _create_station(self, primary_id):
+        data = self._read_json()
+        name = str(data.get("name") or "secondary")
+        station = self._db().create_station(primary_id, name[:128])
+        self._send_json(201, station)
+
+    def _converge(self, primary_id, secondary_id):
+        result = self._db().converge_station(primary_id, secondary_id)
+        self._send_json(200, result)
 
     def _submit_frame(self, link_id):
         data = self._read_json()
