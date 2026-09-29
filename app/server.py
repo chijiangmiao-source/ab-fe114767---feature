@@ -1,12 +1,18 @@
 """HTTP API + static page for the deep-space frame receiver.
 
 Endpoints
-    GET  /                       static single-page UI
-    GET  /healthz                liveness probe -> 200 {"status":"ok"}
-    GET  /api/links              list links with window state
-    POST /api/links              {"name": ...} -> create link
-    GET  /api/links/{id}         link state (highest extended seq + bitmap)
-    POST /api/links/{id}/frames   submit an arriving frame
+    GET  /                                       static single-page UI
+    GET  /healthz                                liveness probe -> {"status":"ok"}
+    GET  /api/links                              list links with window state
+    POST /api/links                              {"name": ...} -> create link
+    GET  /api/links/{id}                         primary window state
+    POST /api/links/{id}/frames                  submit a frame at the primary
+    POST /api/links/{id}/snapshots               freeze a same-origin snapshot
+    GET  /api/links/{id}/stations                list secondary stations
+    POST /api/links/{id}/stations                fork a station from a snapshot
+    GET  /api/stations/{sid}                     secondary window state
+    POST /api/links/{id}/stations/{sid}/frames   submit a frame at a secondary
+    POST /api/links/{id}/stations/{sid}/converge merge the two stations once
 
 Frame body: {"counter": <u32>, "receipt_id": "...", "payload": ...}
 Verdict:    {"status": "accepted|duplicate|expired|rejected", ...}
@@ -17,7 +23,7 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from .db import Database, ReceiptConflict
+from .db import Database, OriginError, ReceiptConflict
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 COUNTER_MAX = (1 << 32) - 1
@@ -60,32 +66,68 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        parts = path.strip("/").split("/")
         if path == "/healthz":
             self._send_json(200, {"status": "ok"})
         elif path == "/api/links":
             self._send_json(200, {"links": self._db().list_links()})
-        elif path.startswith("/api/links/"):
-            link_id = path.split("/")[3]
-            link = self._db().get_link(link_id)
-            if link is None:
-                self._send_json(404, {"error": "unknown link"})
+        elif (len(parts) == 3 and parts[0] == "api"
+              and parts[1] == "links"):
+            self._get_link(parts[2])
+        elif (len(parts) == 4 and parts[0] == "api"
+              and parts[1] == "links" and parts[3] == "stations"):
+            self._send_json(200, {"stations":
+                                  self._db().list_stations(parts[2])})
+        elif len(parts) == 3 and parts[:2] == ["api", "stations"]:
+            station = self._db().get_station(parts[2])
+            if station is None:
+                self._send_json(404, {"error": "unknown station"})
             else:
-                self._send_json(200, link)
+                self._send_json(200, station)
+        elif len(parts) == 3 and parts[:2] == ["api", "snapshots"]:
+            snapshot = self._db().get_snapshot(parts[2])
+            if snapshot is None:
+                self._send_json(404, {"error": "unknown snapshot"})
+            else:
+                self._send_json(200, snapshot)
         elif path in ("/", "/index.html"):
             self._serve_index()
         else:
             self._send_json(404, {"error": "not found"})
 
+    def _get_link(self, link_id):
+        link = self._db().get_link(link_id)
+        if link is None:
+            self._send_json(404, {"error": "unknown link"})
+            return
+        link["stations"] = self._db().list_stations(link_id)
+        self._send_json(200, link)
+
     def do_POST(self):
         path = urlparse(self.path).path
+        parts = path.strip("/").split("/")
         try:
             if path == "/api/links":
                 data = self._read_json()
                 name = str(data.get("name") or "link")
-                link = self._db().create_link(name[:128])
-                self._send_json(201, link)
-            elif path.startswith("/api/links/") and path.endswith("/frames"):
-                self._submit_frame(path.split("/")[3])
+                self._send_json(201, self._db().create_link(name[:128]))
+            elif (len(parts) == 4 and parts[:2] == ["api", "links"]
+                  and parts[3] == "frames"):
+                # api/links/{id}/frames
+                self._submit_frame(parts[2], None)
+            elif (len(parts) == 4 and parts[:2] == ["api", "links"]
+                  and parts[3] == "snapshots"):
+                self._create_snapshot(parts[2])
+            elif (len(parts) == 4 and parts[:2] == ["api", "links"]
+                  and parts[3] == "stations"):
+                self._create_station(parts[2])
+            elif (len(parts) == 6 and parts[:2] == ["api", "links"]
+                  and parts[3] == "stations" and parts[5] == "frames"):
+                # api/links/{id}/stations/{sid}/frames
+                self._submit_frame(parts[2], parts[4])
+            elif (len(parts) == 6 and parts[:2] == ["api", "links"]
+                  and parts[3] == "stations" and parts[5] == "converge"):
+                self._converge(parts[2], parts[4])
             else:
                 self._send_json(404, {"error": "not found"})
         except _BadRequest as exc:
@@ -93,10 +135,30 @@ class Handler(BaseHTTPRequestHandler):
         except ReceiptConflict:
             self._send_json(409, {"error": "receipt id reused with a different "
                                            "link, counter or payload"})
+        except OriginError:
+            self._send_json(409, {"error": "snapshot or station is not from "
+                                           "this link (foreign origin)"})
         except LookupError:
-            self._send_json(404, {"error": "unknown link"})
+            self._send_json(404, {"error": "unknown link, station or snapshot"})
 
-    def _submit_frame(self, link_id):
+    def _create_snapshot(self, link_id):
+        self._send_json(201, self._db().create_snapshot(link_id))
+
+    def _create_station(self, link_id):
+        data = self._read_json()
+        snapshot_id = str(data.get("snapshot_id") or "").strip()
+        if not snapshot_id:
+            raise _BadRequest("snapshot_id is required")
+        name = str(data.get("name") or "secondary")
+        station = self._db().create_station(
+            link_id, name[:128], snapshot_id)
+        self._send_json(201, station)
+
+    def _converge(self, link_id, station_id):
+        result = self._db().converge(link_id, station_id)
+        self._send_json(200, result)
+
+    def _submit_frame(self, link_id, station_id):
         data = self._read_json()
         if "counter" not in data:
             raise _BadRequest("counter is required")
@@ -110,7 +172,8 @@ class Handler(BaseHTTPRequestHandler):
             raise _BadRequest("counter must be an unsigned 32-bit integer")
         payload = data.get("payload")
         verdict = self._db().submit_frame(
-            link_id, counter, str(data["receipt_id"]), payload
+            link_id, counter, str(data["receipt_id"]), payload,
+            station_id=station_id,
         )
         self._send_json(200, verdict)
 

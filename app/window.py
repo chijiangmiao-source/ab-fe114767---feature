@@ -113,3 +113,54 @@ def recent_positions(highest, bitmap, limit=WINDOW_SIZE):
         if bitmap & (1 << offset):
             positions.append(highest - offset)
     return positions
+
+
+def _project(highest, bitmap, target_highest):
+    """Project a bitmap anchored at ``highest`` onto ``target_highest``.
+
+    ``target_highest`` must be >= ``highest`` (callers project onto the
+    higher of the two anchors).  Returns a bitmap relative to
+    ``target_highest`` (bit 0 = target).  Bits that land at offset
+    >= WINDOW_SIZE have fallen outside the target window and are dropped
+    here, rather than being carried back into the acceptable range.
+    """
+    delta = target_highest - highest
+    if delta >= WINDOW_SIZE:
+        return 0
+    return (bitmap << delta) & ((1 << WINDOW_SIZE) - 1)
+
+
+def merge_windows(h_a, bitmap_a, h_b, bitmap_b):
+    """Merge two same-origin station windows after a reconnect.
+
+    A secondary station is forked from an explicit snapshot of the primary,
+    so both bitmaps describe extended sequence numbers in the *same* epoch
+    coordinate system; the snapshot's base is the common reference.  Each
+    bitmap is projected onto the higher of the two highest sequence numbers
+    and the projections are unioned.  Positions that project outside the
+    resulting ``highest-63 .. highest`` window are discarded.
+
+    Returns ``(merged_highest, merged_bitmap, added_a, added_b)`` where
+    ``added_a`` lists positions B had and A was missing, and ``added_b``
+    lists positions A had and B was missing; both are restricted to the
+    merged window and ordered newest first.  When one side has never seen a
+    frame, the other side is returned verbatim with no additions.
+    """
+    mask = (1 << WINDOW_SIZE) - 1
+    if h_a is None:
+        return h_b, bitmap_b & mask, [], []
+    if h_b is None:
+        return h_a, bitmap_a & mask, [], []
+
+    target = max(h_a, h_b)
+    proj_a = _project(h_a, bitmap_a, target)
+    proj_b = _project(h_b, bitmap_b, target)
+    merged = (proj_a | proj_b) & mask
+
+    def _positions(extra_bits):
+        return [target - offset for offset in range(WINDOW_SIZE)
+                if extra_bits & (1 << offset)]
+
+    added_a = _positions(proj_b & ~proj_a & mask)   # B fills gaps in A
+    added_b = _positions(proj_a & ~proj_b & mask)   # A fills gaps in B
+    return target, merged, added_a, added_b

@@ -156,5 +156,68 @@ class TestRecentPositions(unittest.TestCase):
         self.assertEqual(win.recent_positions(h, b), [12, 11, 10])
 
 
+class TestMergeWindows(unittest.TestCase):
+    def test_one_side_empty_returns_other(self):
+        h, b = 10, 0b111
+        self.assertEqual(win.merge_windows(None, 0, h, b)[:2], (h, b))
+        self.assertEqual(win.merge_windows(h, b, None, 0)[:2], (h, b))
+
+    def test_union_projects_onto_higher_and_reports_gaps(self):
+        # A highest 3, holds positions 3,1,0 (bits 0,2,3).
+        # B highest 4, holds positions 4,2,0 (bits 0,2,4).
+        h_a, b_a = 3, 0b1101
+        h_b, b_b = 4, 0b10101
+        # Project A onto 4 (shift 1): positions 3,1,0.
+        # B anchored at 4: positions 4,2,0. Union -> 4,3,2,1,0 contiguous.
+        merged_h, merged_b, added_a, added_b = win.merge_windows(
+            h_a, b_a, h_b, b_b)
+        self.assertEqual(merged_h, 4)
+        self.assertEqual(merged_b, 0b11111)        # 4,3,2,1,0 all present
+        self.assertEqual(added_a, [4, 2])          # B filled A's gaps
+        self.assertEqual(added_b, [3, 1])          # A filled B's gaps
+
+    def test_equal_highest_simple_union(self):
+        # Both highest 10; A has 10,8 and B has 10,9.
+        mh, mb, added_a, added_b = win.merge_windows(
+            10, (1 << 0) | (1 << 2), 10, (1 << 0) | (1 << 1))
+        self.assertEqual((mh, mb), (10, 0b111))
+        self.assertEqual(added_a, [9])
+        self.assertEqual(added_b, [8])
+
+    def test_positions_outside_merged_window_are_dropped(self):
+        # A jumped 100 frames ahead; B still sits at highest 5 with 5 and 0.
+        # Projecting B onto 100 shifts by 95 >= 64: every B bit falls out and
+        # is dropped, never carried back into the acceptable window.
+        h_a, b_a = 100, 1 << 0
+        h_b, b_b = 5, (1 << 0) | (1 << 5)
+        mh, mb, added_a, added_b = win.merge_windows(
+            h_a, b_a, h_b, b_b)
+        self.assertEqual(mh, 100)
+        self.assertEqual(mb, 1)                   # only A's highest survives
+        self.assertEqual(added_a, [])             # B filled nothing in window
+        self.assertEqual(added_b, [100])          # A's 100 is new to B
+
+    def test_merge_after_wrap_each_side_saw_different_frames(self):
+        # Common base at the wrap boundary: both stations held MOD-2, MOD-1.
+        base_h, base_b = MOD - 1, 0b11
+        # Primary goes into epoch 1 seeing 0 and 2.
+        _, p_h, p_b = win.decide(0, base_h, base_b)
+        _, p_h, p_b = win.decide(2, p_h, p_b)
+        # Secondary independently sees 1 and then 3 (its highest runs ahead).
+        _, s_h, s_b = win.decide(1, base_h, base_b)
+        _, s_h, s_b = win.decide(3, s_h, s_b)
+
+        mh, mb, added_a, added_b = win.merge_windows(
+            p_h, p_b, s_h, s_b)
+        self.assertEqual(mh, MOD + 3)
+        # Continuous MOD-2 .. MOD+3 => six low bits set.
+        self.assertEqual(mb, 0b111111)
+        self.assertEqual(added_a, [MOD + 3, MOD + 1])  # B filled into A
+        self.assertEqual(added_b, [MOD + 2, MOD])      # A filled into B
+        # After convergence an old epoch-0 frame far behind stays expired.
+        status, _, _ = win.decide(MOD - 100 & (MOD - 1), mh, mb)
+        self.assertEqual(status, "expired")
+
+
 if __name__ == "__main__":
     unittest.main()
